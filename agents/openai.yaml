@@ -1,0 +1,5 @@
+interface:
+  display_name: Paper Reader
+  short_description: Chinese narrative academic paper reader with robust figure extraction.
+  icon: 📄
+  brand_color: '#4f46e5'

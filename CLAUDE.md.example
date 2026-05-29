@@ -1,0 +1,15 @@
+# Project instruction: paper reading
+
+When I ask `/paper <PDF path>` or ask you to read an academic PDF, follow the Paper Reader workflow:
+
+1. Extract PDF text with `scripts/extract_pdf_text.py`.
+2. Run `scripts/find_figures.py` to locate true main figure caption pages.
+3. Do not confuse in-text mentions such as `Fig. 1a,b` with actual figure captions.
+4. Extract complete composite figures with `scripts/extract_figures.py --crop --debug`; use `--full-page` if a crop omits any panel, axis label, legend, scale bar, or panel letter.
+5. Render important pages with `scripts/render_pdf_pages.py` when figures/tables need visual inspection.
+6. Generate a Chinese Markdown reading note in the same directory as the PDF, named `<PDF_STEM>_reading_note.md`.
+7. Save figure files in `<PDF_STEM>_assets/` and embed them with relative Markdown image paths.
+8. The note should keep the original Paper Reader style: professional narrative opening, question-driven figure analysis, method-figure fusion, evidence-strength judgment, critical analysis, and actionable relevance to my autoimmune disease epithelial-cell MP research.
+9. Borrow the uploaded WeChat article style only for readability and structure, not for exaggeration. Scientific accuracy comes first.
+10. For each figure, explain why the analysis was done, what each panel shows, what conclusion it supports, and where the evidence is weak or overinterpreted.
+11. Do not invent missing details. Mark missing details as “文中未明确说明”.
