@@ -167,17 +167,40 @@ Do not force relevance. If the paper is unrelated, say so, then briefly state wh
 
 ## Quality checklist before saving
 
+**This checklist is mandatory. The note is not complete until every item is checked.**
+
+### Figure extraction QC
 - [ ] Figure index used true caption anchors, not in-text references.
 - [ ] `recommended_page` and visual-content status were checked; text-only pages were not embedded as figures.
 - [ ] Figure files contain complete composite figures or clearly marked multi-part full pages.
 - [ ] Figure crops were checked with `--debug` or full-page renders when the layout was complex.
+
+### Writing quality
 - [ ] Title is an engaging Chinese punchline, not “Paper Title 阅读笔记”.
-- [ ] 开场白 connects the paper to the reader's research context.
-- [ ] Each main figure is analyzed by question, design, observation, interpretation, and evidence strength.
-- [ ] Methods and parameters are woven into figure descriptions.
-- [ ] Claims are tied to figure/table evidence.
-- [ ] 批判性分析 identifies real evidence gaps and gives actionable “如果是我会怎么做” suggestions.
-- [ ] 对当前研究的可借鉴点 includes autoimmune disease epithelial-cell MP relevance when appropriate.
+- [ ] 开场白 is ≥2 paragraphs: starts with scientific question, connects to reader's research, previews core discovery.
+- [ ] 省流版预告 has 4-5 items: core finding, strongest evidence (with Fig#), best method, evidence boundary.
 - [ ] Missing information is marked as `文中未明确说明`.
 - [ ] The note reads like a coherent scientific story, not a filled template.
-- [ ] Markdown file is saved at `<PDF_STEM>_reading_note.md`.
+
+### Figure-by-Figure depth (per figure)
+- [ ] Each figure has: 位置→动机→方法→panel-by-panel观察→证据评估→要点 (6-part structure)
+- [ ] All panels covered — no skipped panels
+- [ ] Quantitative values extracted: specific p-values, FDR, effect sizes, sample sizes (not just “significant”)
+- [ ] Statistical tests named (t-test/ANOVA/DESeq2/edgeR/scCODA etc.)
+- [ ] Evidence level stated (descriptive/correlative/predictive/mechanistic/causal/validation)
+- [ ] Each figure section ≥60 lines (a 1-figure summary is not acceptable)
+
+### Evidence and critique
+- [ ] Claims are tied to figure/table evidence.
+- [ ] Methods and parameters are woven into figure descriptions.
+- [ ] 批判性分析 has ≥3 specific contradiction points, each with “如果是我会怎么做”.
+- [ ] 对当前研究的可借鉴点 has 5 sub-sections: reusable analysis, figure design, experimental logic, Pan-AID specific, writing tips.
+
+### Numeric extraction checklist
+- [ ] All p-values/FDR/effect sizes from the text and figure legends have been extracted and cited
+- [ ] Sample sizes written at correct unit level (donors/samples/cells/ROIs)
+
+### File handling
+- [ ] Markdown file is saved at correct path.
+- [ ] Image paths use `%20` for spaces (Obsidian compatibility).
+
