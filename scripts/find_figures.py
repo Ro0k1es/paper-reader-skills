@@ -46,8 +46,9 @@ REFERENCE_WORD_RE = re.compile(
 )
 CAPTION_SEPARATOR_RE = re.compile(r"^\s*(?:[\.:\|]|[–—-])")
 
-MIN_VISUAL_FRACTION = 0.012
-MIN_WEAK_VISUAL_FRACTION = 0.004
+MIN_VISUAL_FRACTION = 0.015  # 1.5% — must be above scatter from logos/decorations
+MIN_WEAK_VISUAL_FRACTION = 0.006
+LARGE_CLUSTER_PAGE_FRACTION = 0.012  # visual in ≥1 large cluster must exceed this
 
 
 @dataclass
@@ -130,8 +131,13 @@ def classify_caption_line(text: str) -> dict[str, str] | None:
     strong_separator = bool(CAPTION_SEPARATOR_RE.match(tail))
     # Some publishers expose captions as "Fig. 1 Title...". Keep these only
     # when the tail is long enough to look like a caption title, not a reference.
-    title_like = len(tail_l) >= 24 and not tail_l.startswith(
-        ("shows ", "showed ", "showing ", "depicts ", "illustrates ", "indicates ")
+    title_like = len(tail_l) >= 50 and not tail_l.lower().startswith(
+        (
+            "shows ", "showed ", "showing ", "depicts ", "illustrates ",
+            "indicates ", "is a", "was ", "has been", "provides ", "represents ",
+            "demonstrates", "highlights ", "presents ", "summarizes ", "outlines ",
+            "describes ", "contains ", "displays ", "reveals ", "confirms ",
+        )
     )
     if not (strong_separator or title_like):
         return None
@@ -291,7 +297,11 @@ def choose_recommended_page(
 
     same = next((c for c in candidates if c[0] == caption_page), None)
     if same and visual_status(same[1], same[2]):
-        return same[0], same[1], same[2], "caption-page-ok"
+        # Verify: visual must come from large coherent clusters, not scattered decorations.
+        if _has_large_visual_cluster(fitz, doc.load_page(caption_page)):
+            return same[0], same[1], same[2], "caption-page-ok"
+        else:
+            return None, same[1], same[2], "caption-page-only-scattered-visuals"
 
     # When the caption page is low-visual, nearby-page rescue can be useful, but
     # it is also dangerous: the nearest visual page may be a different figure.
@@ -306,12 +316,40 @@ def choose_recommended_page(
         safe_candidates.append((idx, frac, count))
 
     good = [c for c in safe_candidates if visual_status(c[1], c[2])]
+    # Among visual candidates, prefer those with large coherent clusters.
     if good:
-        best = max(good, key=lambda c: (c[1], c[2]))
-        return best[0], best[1], best[2], "nearby-visual-page"
+        scored: list[tuple[float, int, int, float]] = []
+        for idx, frac, count in good:
+            lc = _large_cluster_fraction(fitz, doc.load_page(idx))
+            scored.append((frac + lc * 2, idx, count, frac))
+        scored.sort(reverse=True)
+        best_frac, best_idx, best_count, _ = scored[0]
+        if _has_large_visual_cluster(fitz, doc.load_page(best_idx)):
+            return best_idx, best_frac, best_count, "nearby-visual-page"
+        else:
+            return None, best_frac, best_count, "nearby-page-only-scattered-visuals"
 
     best = max(candidates, key=lambda c: (c[1], c[2]))
     return None, best[1], best[2], "text-only-or-low-visual"
+
+
+def _large_cluster_fraction(fitz: Any, page: Any) -> float:
+    """Fraction of page area covered by visual clusters larger than 1% of page."""
+    rects = visual_rects(fitz, page)
+    if not rects:
+        return 0.0
+    clusters = cluster_rects(fitz, rects)
+    page_area = page.rect.width * page.rect.height
+    large_threshold = page_area * 0.01
+    large_area = sum(
+        c.width * c.height for c in clusters if c.width * c.height > large_threshold
+    )
+    return large_area / max(page_area, 1)
+
+
+def _has_large_visual_cluster(fitz: Any, page: Any) -> bool:
+    """True when the page contains at least one visual cluster >1.2% of page area."""
+    return _large_cluster_fraction(fitz, page) >= LARGE_CLUSTER_PAGE_FRACTION
 
 
 def find_caption_candidates(pdf_path: Path, include_references: bool = False, scan_nearby: int = 2) -> list[dict[str, Any]]:

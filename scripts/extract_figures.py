@@ -38,8 +38,9 @@ REFERENCE_WORD_RE = re.compile(
 )
 CAPTION_SEPARATOR_RE = re.compile(r"^\s*(?:[\.:\|]|[–—-])")
 
-MIN_VISUAL_FRACTION = 0.012
-MIN_WEAK_VISUAL_FRACTION = 0.004
+MIN_VISUAL_FRACTION = 0.015
+MIN_WEAK_VISUAL_FRACTION = 0.006
+LARGE_CLUSTER_PAGE_FRACTION = 0.012  # at least 1.2% from large clusters
 
 
 @dataclass
@@ -171,8 +172,13 @@ def classify_caption_line(text: str) -> dict[str, str] | None:
     if REFERENCE_PANEL_RE.match(tail) or REFERENCE_WORD_RE.match(tail):
         return None
     strong_separator = bool(CAPTION_SEPARATOR_RE.match(tail))
-    title_like = len(tail_l) >= 24 and not tail_l.startswith(
-        ("shows ", "showed ", "showing ", "depicts ", "illustrates ", "indicates ")
+    title_like = len(tail_l) >= 50 and not tail_l.lower().startswith(
+        (
+            "shows ", "showed ", "showing ", "depicts ", "illustrates ",
+            "indicates ", "is a", "was ", "has been", "provides ", "represents ",
+            "demonstrates", "highlights ", "presents ", "summarizes ", "outlines ",
+            "describes ", "contains ", "displays ", "reveals ", "confirms ",
+        )
     )
     if not (strong_separator or title_like):
         return None
@@ -304,7 +310,10 @@ def choose_recommended_page(
         return None, 0.0, 0, "no-candidate"
     same = next((c for c in candidates if c[0] == caption_page), None)
     if same and visual_status(same[1], same[2]):
-        return same[0], same[1], same[2], "caption-page-ok"
+        if _has_large_visual_cluster(fitz, doc.load_page(caption_page)):
+            return same[0], same[1], same[2], "caption-page-ok"
+        else:
+            return None, same[1], same[2], "caption-page-only-scattered-visuals"
 
     safe_candidates = []
     for idx, frac, count in candidates:
@@ -315,10 +324,36 @@ def choose_recommended_page(
 
     good = [c for c in safe_candidates if visual_status(c[1], c[2])]
     if good:
-        best = max(good, key=lambda c: (c[1], c[2]))
-        return best[0], best[1], best[2], "nearby-visual-page"
+        scored: list[tuple[float, int, int]] = []
+        for idx, frac, count in good:
+            lc = _large_cluster_fraction(fitz, doc.load_page(idx))
+            scored.append((frac + lc * 2, idx, count))
+        scored.sort(reverse=True)
+        best_score, best_idx, best_count = scored[0]
+        if _has_large_visual_cluster(fitz, doc.load_page(best_idx)):
+            return best_idx, best_score, best_count, "nearby-visual-page"
+        else:
+            return None, best_score, best_count, "nearby-page-only-scattered-visuals"
+
     best = max(candidates, key=lambda c: (c[1], c[2]))
     return None, best[1], best[2], "text-only-or-low-visual"
+
+
+def _large_cluster_fraction(fitz: Any, page: Any) -> float:
+    rects = visual_rects(fitz, page)
+    if not rects:
+        return 0.0
+    clusters = cluster_rects(fitz, rects)
+    page_area = page.rect.width * page.rect.height
+    large_threshold = page_area * 0.01
+    large_area = sum(
+        c.width * c.height for c in clusters if c.width * c.height > large_threshold
+    )
+    return large_area / max(page_area, 1)
+
+
+def _has_large_visual_cluster(fitz: Any, page: Any) -> bool:
+    return _large_cluster_fraction(fitz, page) >= LARGE_CLUSTER_PAGE_FRACTION
 
 
 def find_captions(fitz: Any, doc: Any, scan_nearby: int) -> list[Caption]:
@@ -386,11 +421,25 @@ def rect_in_band(rect: Any, y0: float, y1: float) -> bool:
     return y0 <= center_y <= y1
 
 
-def vertical_band_for_caption(page: Any, cap: Caption | None, captions: list[Caption]) -> tuple[float, float, str]:
+def vertical_band_for_caption(
+    fitz: Any,
+    page: Any,
+    cap: Caption | None,
+    captions: list[Caption],
+    all_visuals: list[Any],
+) -> tuple[float, float, str]:
+    """Determine figure band using visual-object density, not a hard threshold.
+
+    Compares visual area above vs below the caption line. The side with more
+    visual content wins. Only falls back to a position tiebreaker when both
+    sides contain negligible visual content.
+    """
     page_rect = page.rect
     if cap is None:
         return 0.0, page_rect.height, "no-caption"
-    page_caps = sorted([c for c in captions if c.page_index == cap.page_index], key=lambda c: c.bbox.y0)
+    page_caps = sorted(
+        [c for c in captions if c.page_index == cap.page_index], key=lambda c: c.bbox.y0
+    )
     idx = page_caps.index(cap) if cap in page_caps else -1
     prev_bottom = 0.0
     next_top = page_rect.height
@@ -398,9 +447,36 @@ def vertical_band_for_caption(page: Any, cap: Caption | None, captions: list[Cap
         prev_bottom = page_caps[idx - 1].bbox.y1
     if 0 <= idx < len(page_caps) - 1:
         next_top = page_caps[idx + 1].bbox.y0
-    if cap.bbox.y0 > page_rect.height * 0.35:
-        return max(0.0, prev_bottom), max(0.0, cap.bbox.y0), "caption-below"
-    return min(page_rect.height, cap.bbox.y1), min(page_rect.height, next_top), "caption-above"
+
+    area_above = sum(
+        r.width * r.height
+        for r in all_visuals
+        if prev_bottom <= (r.y0 + r.y1) / 2 < cap.bbox.y0
+    )
+    area_below = sum(
+        r.width * r.height
+        for r in all_visuals
+        if cap.bbox.y0 <= (r.y0 + r.y1) / 2 < next_top
+    )
+    min_delta = page_rect.width * page_rect.height * 0.005  # 0.5% of page
+
+    if area_above > area_below + min_delta:
+        return (
+            max(0.0, prev_bottom),
+            max(0.0, cap.bbox.y0),
+            "caption-below(density-above={:.1f}%)".format(area_above / (page_rect.width * page_rect.height) * 100),
+        )
+    elif area_below > area_above + min_delta:
+        return (
+            min(page_rect.height, cap.bbox.y1),
+            min(page_rect.height, next_top),
+            "caption-above(density-below={:.1f}%)".format(area_below / (page_rect.width * page_rect.height) * 100),
+        )
+    # Tie: use caption vertical position as tiebreaker
+    if cap.bbox.y0 > page_rect.height * 0.5:
+        return max(0.0, prev_bottom), max(0.0, cap.bbox.y0), "caption-below(tiebreaker)"
+    else:
+        return min(page_rect.height, cap.bbox.y1), min(page_rect.height, next_top), "caption-above(tiebreaker)"
 
 
 def smart_crop_rect(
@@ -423,14 +499,14 @@ def smart_crop_rect(
             return page_rect, "forced-full-page:text-only", frac, count
         return None, "skip:no-visual-objects", frac, count
 
-    y0, y1, band_reason = vertical_band_for_caption(page, cap, captions) if cap and cap.page_index == page_index else (0.0, page_rect.height, "visual-page")
+    y0, y1, band_reason = vertical_band_for_caption(fitz, page, cap, captions, all_visuals) if cap and cap.page_index == page_index else (0.0, page_rect.height, "visual-page")
     visuals = [r for r in all_visuals if rect_in_band(r, y0, y1) and not is_caption_rect(r, captions, page_index)]
     if not visuals:
         visuals = [r for r in all_visuals if not is_caption_rect(r, captions, page_index)]
     if not visuals:
         return None, f"skip:no-visuals-after-caption-filter:{band_reason}", frac, count
 
-    clusters = cluster_rects(fitz, visuals, gap=28)
+    clusters = cluster_rects(fitz, visuals, gap=max(16, page_rect.width * 0.035))
     page_area = page_rect.width * page_rect.height
     # Drop obvious small decorative clusters but keep separated panels.
     large = [c for c in clusters if c.width * c.height > page_area * 0.002 or (c.width > page_rect.width * 0.12 and c.height > page_rect.height * 0.04)]
@@ -456,7 +532,138 @@ def smart_crop_rect(
     final_rect = expand_rect(fitz, final_rect, margin=margin, page_rect=page_rect)
     if final_rect.width < page_rect.width * 0.12 or final_rect.height < page_rect.height * 0.08:
         return None, f"skip:suspiciously-small-crop:{band_reason}", frac, count
+
+    # Trim figure legend text from the bottom of the crop.
+    # Figure legends are dense blocks of long text lines (not axis labels / panel letters).
+    trimmed, trim_reason = trim_figure_legend(fitz, page, final_rect)
+    if trimmed is not None:
+        return trimmed, f"smart:{band_reason}+{trim_reason}", frac, count
     return final_rect, f"smart:{band_reason}", frac, count
+
+
+def trim_figure_legend(
+    fitz: Any, page: Any, crop_rect: Any
+) -> tuple[Any | None, str]:
+    """Remove figure legend text from the bottom of a crop.
+
+    Figure legends differ from in-figure labels (axis text, panel letters,
+    color-bar annotations) in three ways:
+      1. They consist of long text lines (>30 chars typical).
+      2. They form a dense text block with low visual-object density.
+      3. They sit at the very bottom of the figure, below all panels.
+
+    Returns (trimmed_rect, reason) or (None, reason) if no trimming needed.
+    """
+    page_rect = page.rect
+    crop_w = crop_rect.width
+    crop_h = crop_rect.height
+
+    # Only inspect the bottom 35% of the crop.
+    inspect_top = crop_rect.y0 + crop_h * 0.65
+    inspect_rect = fitz.Rect(crop_rect.x0, inspect_top, crop_rect.x1, crop_rect.y1)
+
+    text_spans = span_rects(fitz, page)
+    visual_objs = visual_rects(fitz, page)
+
+    # Divide into horizontal strips (~8% of crop height each).
+    strip_h = max(12, crop_h * 0.08)
+    num_strips = max(1, int((crop_rect.y1 - inspect_top) / strip_h))
+
+    strips: list[dict[str, Any]] = []
+    for i in range(num_strips):
+        y0 = inspect_top + i * strip_h
+        y1 = min(crop_rect.y1, y0 + strip_h)
+        strip_area = crop_w * (y1 - y0)
+
+        # Text metrics in this strip
+        strip_texts = [
+            s
+            for s in text_spans
+            if s.intersects(fitz.Rect(crop_rect.x0, y0, crop_rect.x1, y1))
+        ]
+        text_area = sum(
+            min(s.x1, crop_rect.x1) - max(s.x0, crop_rect.x0)
+            for s in strip_texts
+            if s.x1 > crop_rect.x0 and s.x0 < crop_rect.x1
+        ) * 6  # approximate height per span
+        text_area_ratio = min(0.99, text_area / max(strip_area, 1))
+        avg_text_width = (
+            sum(min(s.width, crop_w) for s in strip_texts) / max(len(strip_texts), 1)
+            if strip_texts
+            else 0
+        )
+
+        # Visual metrics
+        strip_visuals = [
+            v
+            for v in visual_objs
+            if v.intersects(fitz.Rect(crop_rect.x0, y0, crop_rect.x1, y1))
+        ]
+        visual_area = sum(
+            min(v.x1, crop_rect.x1) - max(v.x0, crop_rect.x0)
+            for v in strip_visuals
+            if v.x1 > crop_rect.x0 and v.x0 < crop_rect.x1
+        ) * min(v.height for v in strip_visuals) if strip_visuals else 0
+        visual_ratio = visual_area / max(strip_area, 1)
+
+        strips.append(
+            {
+                "y0": y0,
+                "y1": y1,
+                "text_ratio": text_area_ratio,
+                "avg_text_w": avg_text_width,
+                "visual_ratio": visual_ratio,
+                "n_text": len(strip_texts),
+            }
+        )
+
+    if not strips:
+        return None, "no-legend-trim(strips-empty)"
+
+    # A strip is legend-like when:
+    #   - text area > 18% of strip
+    #   - average text span width > 30% of crop width (long lines, not axis labels)
+    #   - visual object area < 8%
+    def _legend_like(s: dict) -> bool:
+        return (
+            s["text_ratio"] > 0.18
+            and s["avg_text_w"] > crop_w * 0.30
+            and s["visual_ratio"] < 0.08
+        )
+
+    # Find the bottommost strip that is NOT legend-like.
+    trim_at = crop_rect.y1
+    consecutive_legend = 0
+    for s in reversed(strips):
+        if _legend_like(s):
+            consecutive_legend += 1
+        else:
+            if consecutive_legend >= 2:
+                trim_at = s["y1"]
+            break
+
+    # If the entire inspected zone is legend-like, trim to inspect_top.
+    if consecutive_legend >= 2 and trim_at == crop_rect.y1:
+        # All strips are legend-like; trim to where legend starts.
+        first_legend = None
+        for s in strips:
+            if _legend_like(s):
+                first_legend = s["y0"]
+                break
+        if first_legend is not None:
+            trim_at = first_legend
+
+    if trim_at < crop_rect.y1 - crop_h * 0.05:
+        # Don't trim if it removes less than 5% of the crop height.
+        return None, "no-legend-trim(too-small)"
+
+    trimmed_rect = fitz.Rect(crop_rect.x0, crop_rect.y0, crop_rect.x1, trim_at)
+    # Safety: trimmed crop must still be a reasonable figure size.
+    if trimmed_rect.height < page_rect.height * 0.06:
+        return None, "no-legend-trim(would-destroy-figure)"
+
+    pct_removed = (crop_rect.y1 - trim_at) / crop_h * 100
+    return trimmed_rect, f"legend-trim({pct_removed:.0f}%)"
 
 
 def draw_debug_box(fitz: Any, page: Any, rect: Any, out_path: Path, zoom: float) -> None:
@@ -467,6 +674,212 @@ def draw_debug_box(fitz: Any, page: Any, rect: Any, out_path: Path, zoom: float)
     pix = p.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
     pix.save(str(out_path))
     tmp.close()
+
+
+# ── panel detection ──────────────────────────────────────────────
+
+PANEL_LABEL_RE = re.compile(r"^\s*([a-h])\s*$")  # single-panel letters only
+
+
+def detect_panel_labels(
+    fitz: Any,
+    page: Any,
+    crop_rect: Any,
+) -> list[dict[str, Any]]:
+    """Find isolated panel-label letters (a, b, c, ...) inside a figure crop.
+
+    A genuine panel label is:
+      - a single lowercase letter (a–h)
+      - rendered in a small, often bold, font
+      - positioned near the top-left of its corresponding visual cluster
+      - NOT part of a longer word or sentence
+    """
+    page_rect = page.rect
+    crop_w = crop_rect.width
+    crop_h = crop_rect.height
+    candidates: list[dict[str, Any]] = []
+
+    try:
+        text_dict = page.get_text("dict", clip=crop_rect)
+    except Exception:
+        return candidates
+
+    for block in text_dict.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            if not spans:
+                continue
+            # Collect the full line text and look for isolated single letters.
+            line_text = "".join(s.get("text", "") for s in spans).strip()
+            m = PANEL_LABEL_RE.match(line_text)
+            if not m:
+                continue
+            label = m.group(1)
+            # Compute bounding box of the line.
+            bboxes = [safe_rect(fitz, s["bbox"]) for s in spans]
+            bboxes = [b for b in bboxes if b is not None]
+            if not bboxes:
+                continue
+            bbox = union_rects(fitz, bboxes) if len(bboxes) > 1 else bboxes[0]
+
+            # Heuristic: panel labels are usually bold and small.
+            font_size = max(s.get("size", 0) for s in spans)
+            is_bold = any("Bold" in (s.get("font", "") or "") for s in spans)
+            # Panel labels should not be too large relative to the crop.
+            rel_x = (bbox.x0 - crop_rect.x0) / crop_w if crop_w else 0
+            rel_y = (bbox.y0 - crop_rect.y0) / crop_h if crop_h else 0
+
+            candidates.append(
+                {
+                    "label": label,
+                    "bbox": [round(bbox.x0, 1), round(bbox.y0, 1), round(bbox.x1, 1), round(bbox.y1, 1)],
+                    "font_size": round(font_size, 1),
+                    "is_bold": is_bold,
+                    "rel_x": round(rel_x, 3),
+                    "rel_y": round(rel_y, 3),
+                }
+            )
+
+    # Deduplicate: keep the best-scored candidate for each label.
+    best: dict[str, dict[str, Any]] = {}
+    for c in candidates:
+        score = 0
+        if c["is_bold"]:
+            score += 3
+        # Prefer labels in the upper portion of the figure (<40% from top).
+        if c["rel_y"] < 0.40:
+            score += 2
+        # Penalize very large font (likely a heading).
+        if c["font_size"] < 14:
+            score += 1
+        c["_score"] = score
+        if c["label"] not in best or score > best[c["label"]]["_score"]:
+            best[c["label"]] = c
+
+    # Remove internal scores.
+    for v in best.values():
+        del v["_score"]
+
+    # Sort by expected reading order: top-to-bottom, left-to-right.
+    return sorted(best.values(), key=lambda c: (c["rel_y"], c["rel_x"]))
+
+
+def extract_panels_from_labels(
+    fitz: Any,
+    page: Any,
+    crop_rect: Any,
+    labels: list[dict[str, Any]],
+    margin: float = 6,
+) -> list[dict[str, Any]]:
+    """Partition the figure crop into panels guided by label positions.
+
+    Each panel gets a bounding box that extends from its label to just before
+    the next label (or to the crop edge for the last panel). Panels are split
+    primarily by vertical gaps between their label rows.
+    """
+    if len(labels) < 2:
+        return []
+
+    panels: list[dict[str, Any]] = []
+    n = len(labels)
+
+    for i, lab in enumerate(labels):
+        label_bbox = fitz.Rect(*lab["bbox"])
+        # The panel starts at its label's top-left (with margin).
+        x0 = max(crop_rect.x0, label_bbox.x0 - margin)
+        y0 = max(crop_rect.y0, label_bbox.y0 - margin)
+
+        if i + 1 < n:
+            next_lab = labels[i + 1]
+            next_bbox = fitz.Rect(*next_lab["bbox"])
+            # If the next label is on a significantly lower row, split vertically.
+            if next_bbox.y0 - label_bbox.y1 > crop_rect.height * 0.03:
+                y1 = next_bbox.y0 - margin
+                x1 = crop_rect.x1
+            else:
+                # Same row — split horizontally.
+                x1 = next_bbox.x0 - margin
+                y1 = crop_rect.y1
+        else:
+            x1 = crop_rect.x1
+            y1 = crop_rect.y1
+
+        panel_rect = fitz.Rect(x0, y0, x1, y1) & crop_rect
+        if panel_rect.width > 20 and panel_rect.height > 20:
+            panels.append(
+                {
+                    "panel": lab["label"],
+                    "bbox": [round(panel_rect.x0, 1), round(panel_rect.y0, 1), round(panel_rect.x1, 1), round(panel_rect.y1, 1)],
+                    "status": "ok",
+                }
+            )
+
+    return panels
+
+
+# ── contact sheet ────────────────────────────────────────────────
+
+
+def build_contact_sheet(
+    out_dir: Path,
+    manifest: list[dict[str, Any]],
+    columns: int = 4,
+    thumb_w: int = 320,
+) -> Path | None:
+    """Create a contact-sheet PNG of all extracted figures for quick QC.
+
+    Each thumbnail is labeled with the figure name and status.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None  # Pillow not installed; skip gracefully
+
+    saved = [m for m in manifest if m.get("status") == "saved" and m.get("path")]
+    if not saved:
+        return None
+
+    rows = (len(saved) + columns - 1) // columns
+    label_h = 28
+    cell_w = thumb_w
+    cell_h = int(thumb_w * 0.75)  # 4:3 aspect ratio
+
+    canvas = Image.new("RGB", (columns * cell_w, rows * (cell_h + label_h)), (245, 245, 245))
+    draw = ImageDraw.Draw(canvas)
+
+    try:
+        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 14)
+    except Exception:
+        font = ImageFont.load_default()
+
+    for i, m in enumerate(saved):
+        row = i // columns
+        col = i % columns
+        x = col * cell_w
+        y = row * (cell_h + label_h)
+
+        # Label
+        name = m.get("name", "?")
+        reason = m.get("crop_reason", "")
+        label = f"{name}  [{reason[:60]}]"
+        draw.rectangle([x, y, x + cell_w, y + label_h], fill=(220, 220, 220))
+        draw.text((x + 4, y + 4), label, fill=(40, 40, 40), font=font)
+
+        # Thumbnail
+        try:
+            img = Image.open(m["path"])
+            img.thumbnail((cell_w - 8, cell_h - 8), Image.LANCZOS)
+            px = x + (cell_w - img.width) // 2
+            py = y + label_h + (cell_h - img.height) // 2
+            canvas.paste(img, (px, py))
+        except Exception:
+            draw.text((x + 10, y + label_h + 10), "(load error)", fill=(200, 0, 0), font=font)
+
+    out_path = out_dir / "figure_contact_sheet.png"
+    canvas.save(str(out_path), quality=85)
+    return out_path
 
 
 def build_jobs(doc: Any, args: argparse.Namespace, captions: list[Caption]) -> list[FigureJob]:
@@ -483,8 +896,9 @@ def build_jobs(doc: Any, args: argparse.Namespace, captions: list[Caption]) -> l
                 print(f"  [WARN] Could not find a true caption anchor for {fig}; skipping instead of guessing a text page", file=sys.stderr)
                 continue
             if cap.recommended_page_index is None:
-                print(f"  [WARN] Caption found for {fig} on page {cap.page_index + 1}, but no nearby visual figure page passed validation; skipping", file=sys.stderr)
-                jobs.append(FigureJob(page_index=cap.page_index, out_name=fig.replace(" ", ""), figure_key=fig, caption=cap, status=cap.status))
+                print(f"  [WARN] Caption found for {fig} on page {cap.page_index + 1}, but no visual figure page passed validation — NOT saving. Use --pages to manually specify.", file=sys.stderr)
+                # Do NOT fall back to the caption text page. A text page saved as a
+                # figure is worse than a missing figure.
                 continue
             jobs.append(FigureJob(page_index=cap.recommended_page_index, out_name=fig.replace(" ", ""), figure_key=fig, caption=cap, status=cap.status))
         if names:
@@ -630,12 +1044,38 @@ def main() -> int:
                 "debug_path": str(debug_path) if debug_path else None,
             }
         )
+
+        # ── optional panel extraction ──
+        panels = []
+        if args.crop and clip != page.rect:
+            labels = detect_panel_labels(fitz, page, clip)
+            if len(labels) >= 2:
+                panel_entries = extract_panels_from_labels(fitz, page, clip, labels)
+            else:
+                panel_entries = []
+            for p in panel_entries:
+                p_rect = fitz.Rect(*p["bbox"])
+                # Render each panel at the same zoom factor.
+                p_pix = page.get_pixmap(matrix=matrix, clip=p_rect, alpha=False)
+                p_path = out_dir / f"{job.out_name}_panel_{p['panel']}.png"
+                p_pix.save(str(p_path))
+                p["path"] = str(p_path)
+                p["pixels"] = [p_pix.width, p_pix.height]
+                panels.append(p)
+                print(f"    panel_{p['panel']}.png ({p_pix.width}x{p_pix.height})", file=sys.stderr)
+        item["panels"] = panels
+
         manifest.append(item)
         print(
             f"  {job.out_name}.png <- page {job.page_index + 1} [{reason}] ({pix.width}x{pix.height}) visual_fraction={page_frac:.4f}, objects={page_count}"
         )
         if job.caption:
             print(f"    caption page {job.caption.page_index + 1}: {job.caption.raw_label} | {job.caption.text[:120]}")
+
+    # ── contact sheet ──
+    contact_path = build_contact_sheet(out_dir, manifest)
+    if contact_path:
+        print(f"Contact sheet saved to: {contact_path}", file=sys.stderr)
 
     manifest_path = Path(args.manifest).expanduser().resolve() if args.manifest else out_dir / "figure_manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
